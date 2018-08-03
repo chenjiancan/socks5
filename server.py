@@ -2,14 +2,10 @@ import logging
 import select
 import socket
 import struct
-from socketserver import ThreadingMixIn, TCPServer, StreamRequestHandler
+from socketserver import ThreadingTCPServer, StreamRequestHandler
 
 logging.basicConfig(level=logging.DEBUG)
 SOCKS_VERSION = 5
-
-
-class ThreadingTCPServer(ThreadingMixIn, TCPServer):
-    pass
 
 
 class SocksProxy(StreamRequestHandler):
@@ -31,27 +27,34 @@ class SocksProxy(StreamRequestHandler):
         # get available methods
         methods = self.get_available_methods(nmethods)
 
-        # accept only USERNAME/PASSWORD auth
-        if 2 not in set(methods):
+        # accept USERNAME/PASSWORD auth 02 or dont require AUTH 00
+        if 0 in set(methods):
+            # send welcome message
+            self.connection.sendall(struct.pack("!BB", SOCKS_VERSION, 0))
+        elif 2 in set(methods):
+            if not self.verify_credentials():
+                return
+            # send welcome message
+            self.connection.sendall(struct.pack("!BB", SOCKS_VERSION, 2))
+        else:
             # close connection
             self.server.close_request(self.request)
-            return
-
-        # send welcome message
-        self.connection.sendall(struct.pack("!BB", SOCKS_VERSION, 2))
-
-        if not self.verify_credentials():
             return
 
         # request
         version, cmd, _, address_type = struct.unpack("!BBBB", self.connection.recv(4))
         assert version == SOCKS_VERSION
 
+        address = None
         if address_type == 1:  # IPv4
             address = socket.inet_ntoa(self.connection.recv(4))
         elif address_type == 3:  # Domain name
-            domain_length = ord(self.connection.recv(1)[0])
-            address = self.connection.recv(domain_length)
+            domain_length = ord(self.connection.recv(1))        # parse len
+            domain = self.connection.recv(domain_length)
+            address = domain
+        else:
+            self.server.close_request(self.request)
+            return
 
         port = struct.unpack('!H', self.connection.recv(2))[0]
 
@@ -64,9 +67,11 @@ class SocksProxy(StreamRequestHandler):
                 logging.info('Connected to %s %s' % (address, port))
             else:
                 self.server.close_request(self.request)
+                return
 
             addr = struct.unpack("!I", socket.inet_aton(bind_address[0]))[0]
             port = bind_address[1]
+            address_type = 1    # should be 1
             reply = struct.pack("!BBBBIH", SOCKS_VERSION, 0, 0, address_type,
                                 addr, port)
 
@@ -80,6 +85,7 @@ class SocksProxy(StreamRequestHandler):
         # establish data exchange
         if reply[1] == 0 and cmd == 1:
             self.exchange_loop(self.connection, remote)
+
 
         self.server.close_request(self.request)
 
@@ -130,7 +136,7 @@ class SocksProxy(StreamRequestHandler):
                 data = remote.recv(4096)
                 if client.send(data) <= 0:
                     break
-
+        remote.close()
 
 if __name__ == '__main__':
     with ThreadingTCPServer(('127.0.0.1', 9011), SocksProxy) as server:
